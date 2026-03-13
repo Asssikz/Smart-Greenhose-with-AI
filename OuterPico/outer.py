@@ -1,0 +1,554 @@
+"""
+Voice recorder for Raspberry Pi Pico W
+Mic: INMP441 (I2S) — Non-Blocking version with IRQ callback
+
+Wiring:
+  INMP441 SCK  -> GP0
+  INMP441 WS   -> GP1
+  INMP441 SD   -> GP2
+  INMP441 L/R  -> GND
+  INMP441 VDD  -> 3.3V
+
+  MicroSD SCK  -> GP18
+  MicroSD MOSI -> GP19
+  MicroSD MISO -> GP16
+  MicroSD CS   -> GP17
+  MicroSD VCC  -> VSYS (5V)
+  MicroSD GND  -> GND
+
+  Button       -> GP6  - slot E - PULL_DOWN, button shorts to GND
+  Buzzer       -> GP26 - slot F
+  LED          -> GP4  - slot D
+"""
+
+import os
+import gc
+import time
+import socket
+import ujson
+import bluetooth
+from micropython import const
+
+from machine import Pin, I2S, SPI
+from OuterPico.sdcard import SDCard
+from system_promt import system_prompt
+from pibody import display, Buzzer, LED, Button
+from config import I2S_CONFIG, MicroSD_CONFIG, STATE_MACHINE, OUTER_MODULES
+from secrets import API_CONFIG
+
+try:
+    import ssl
+except ImportError:
+    import ussl as ssl
+
+import urequests
+
+# ── SPI / SD ──────────────────────────────────────────────────────────────────
+cs  = Pin(MicroSD_CONFIG['cs'], Pin.OUT)
+spi = SPI(
+    0,
+    baudrate=400000,
+    polarity=0,
+    phase=0,
+    bits=8,
+    firstbit=SPI.MSB,
+    sck=Pin(MicroSD_CONFIG['sck']),
+    mosi=Pin(MicroSD_CONFIG['mosi']),
+    miso=Pin(MicroSD_CONFIG['miso']),
+)
+sd = SDCard(spi, cs)
+os.mount(sd, "/sd")
+print("SD mounted OK")
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def text_wrap(text, x, y, char_width=8, char_height=12, max_lines=None):
+    """Draw text with automatic line wrapping. Width 240, font 8×12.
+    max_lines: optional limit; if set, last 3 chars of last line become '...' when truncated."""
+    max_chars = (240 - x) // char_width
+    if max_chars <= 0:
+        return
+    lines = []
+    line = ""
+    for char in text:
+        if char == '\n':
+            if line:
+                lines.append(line)
+                line = ""
+        elif len(line) >= max_chars:
+            lines.append(line)
+            line = char
+        else:
+            line += char
+    if line:
+        lines.append(line)
+    if max_lines is not None and len(lines) > max_lines:
+        lines = lines[:max_lines]
+        last = lines[-1]
+        if len(last) >= 3:
+            lines[-1] = last[:-3] + "..."
+        else:
+            lines[-1] = "..."
+    for i, ln in enumerate(lines):
+        display.text(ln, x, y + i * char_height)
+
+def next_wav_path():
+    try:
+        existing = os.listdir("/sd/recordings")
+    except OSError:
+        os.mkdir("/sd/recordings")
+        existing = []
+    indices = [int(n[4:8]) for n in existing
+               if n.startswith("rec_") and n.endswith(".wav") and n[4:8].isdigit()]
+    n = max(indices) + 1 if indices else 0
+    return "/sd/recordings/rec_{:04d}.wav".format(n)
+
+
+def create_wav_header(sample_rate, bits, channels, num_samples):
+    datasize = num_samples * channels * bits // 8
+    o  = b"RIFF"
+    o += (datasize + 36).to_bytes(4, "little")
+    o += b"WAVE"
+    o += b"fmt "
+    o += (16).to_bytes(4, "little")
+    o += (1).to_bytes(2, "little")
+    o += channels.to_bytes(2, "little")
+    o += sample_rate.to_bytes(4, "little")
+    o += (sample_rate * channels * bits // 8).to_bytes(4, "little")
+    o += (channels * bits // 8).to_bytes(2, "little")
+    o += bits.to_bytes(2, "little")
+    o += b"data"
+    o += datasize.to_bytes(4, "little")
+    return o
+
+
+# ── WiFi ──────────────────────────────────────────────────────────────────────
+
+def connect_wifi():
+    import network
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if not wlan.isconnected():
+        print("Connecting to WiFi...")
+        wlan.connect(API_CONFIG['SSID'], API_CONFIG['PASSWORD'])
+        for _ in range(20):
+            if wlan.isconnected():
+                break
+            time.sleep(1)
+    if wlan.isconnected():
+        print("WiFi OK:", wlan.ifconfig()[0])
+    else:
+        print("WiFi FAILED, status:", wlan.status())
+
+
+# ── BLE Central (подключение к Inner Pico) ─────────────────────────────────────
+_ENV_SENSE_UUID  = bluetooth.UUID(0x181A)
+_CHAR_TX_UUID    = bluetooth.UUID(0x2A6E)   # Notify ← Inner
+_CHAR_RX_UUID    = bluetooth.UUID(0x2A6F)   # Write  → Inner
+_IRQ_SCAN_RESULT         = const(5)
+_IRQ_SCAN_DONE            = const(6)
+_IRQ_PERIPHERAL_CONNECT   = const(7)
+_IRQ_PERIPHERAL_DISCONNECT = const(8)
+_IRQ_GATTC_SERVICE_RESULT    = const(9)
+_IRQ_GATTC_SERVICE_DONE      = const(10)
+_IRQ_GATTC_CHARACTERISTIC_RESULT = const(11)
+_IRQ_GATTC_CHARACTERISTIC_DONE    = const(12)
+_IRQ_GATTC_NOTIFY   = const(18)
+_IRQ_GATTC_WRITE_DONE = const(17)
+_ADV_IND = const(0x00)
+_ADV_DIRECT_IND = const(0x01)
+
+# Данные от Inner (tel, act, auto) — обновляются в BLE IRQ.
+# Формат: tel={t,h,l,s,m}, act={c,h,w1,w2,d,p,lg}, auto={c,h,w,d,l,p}
+telemetry_data = {"tel": {}, "act": {}, "auto": {}}
+_ble_rx_buffer = bytearray()
+
+def _decode_adv_name(adv_data):
+    """Парсит Complete Local Name (0x09) из advertising data."""
+    i = 0
+    while i < len(adv_data):
+        if i + 2 > len(adv_data):
+            break
+        length = adv_data[i]
+        ad_type = adv_data[i + 1]
+        if length < 1:
+            i += 1
+            continue
+        if ad_type == 0x09:  # Complete Local Name
+            end = i + 2 + length - 1
+            if end <= len(adv_data):
+                return bytes(adv_data[i + 2:end]).decode("utf-8", "ignore")
+        i += 1 + length
+    return None
+
+def _ble_irq(event, data):
+    global _ble_rx_buffer, telemetry_data
+    ble = ble_central._ble
+    if event == _IRQ_SCAN_RESULT:
+        addr_type, addr, adv_type, rssi, adv_data = data
+        if adv_type in (_ADV_IND, _ADV_DIRECT_IND):
+            name = _decode_adv_name(adv_data)
+            if name and "InnerPico" in name:
+                ble_central._addr_type = addr_type
+                ble_central._addr = bytes(addr)
+                ble_central._name = name
+                ble.gap_scan(None)
+    elif event == _IRQ_SCAN_DONE:
+        if ble_central._scan_done_cb:
+            ble_central._scan_done_cb()
+    elif event == _IRQ_PERIPHERAL_CONNECT:
+        conn_handle, addr_type, addr = data
+        ble_central._conn_handle = conn_handle
+        ble.gattc_discover_services(conn_handle)
+    elif event == _IRQ_PERIPHERAL_DISCONNECT:
+        conn_handle, _, _ = data
+        if conn_handle == ble_central._conn_handle:
+            ble_central._conn_handle = None
+            ble_central._tx_handle = None
+            ble_central._rx_handle = None
+            print("[BLE] Disconnected")
+    elif event == _IRQ_GATTC_SERVICE_RESULT:
+        conn_handle, start_h, end_h, uuid = data
+        if conn_handle == ble_central._conn_handle and uuid == _ENV_SENSE_UUID:
+            ble_central._start_handle, ble_central._end_handle = start_h, end_h
+    elif event == _IRQ_GATTC_SERVICE_DONE:
+        if ble_central._conn_handle and ble_central._start_handle is not None:
+            ble.gattc_discover_characteristics(
+                ble_central._conn_handle,
+                ble_central._start_handle,
+                ble_central._end_handle,
+            )
+    elif event == _IRQ_GATTC_CHARACTERISTIC_RESULT:
+        conn_handle, def_h, value_h, props, uuid = data
+        if conn_handle == ble_central._conn_handle:
+            if uuid == _CHAR_TX_UUID:
+                ble_central._tx_handle = value_h
+            elif uuid == _CHAR_RX_UUID:
+                ble_central._rx_handle = value_h
+    elif event == _IRQ_GATTC_CHARACTERISTIC_DONE:
+        if ble_central._tx_handle is not None and ble_central._rx_handle is not None:
+            # Подписываемся на Notify (CCCD = value_handle + 1)
+            cccd = ble_central._tx_handle + 1
+            try:
+                ble.gattc_write(ble_central._conn_handle, cccd, b"\x01\x00", 1)
+            except Exception:
+                pass
+            if ble_central._conn_cb:
+                ble_central._conn_cb()
+    elif event == _IRQ_GATTC_NOTIFY:
+        conn_handle, value_handle, notify_data = data
+        if conn_handle == ble_central._conn_handle and value_handle == ble_central._tx_handle:
+            _ble_rx_buffer.extend(notify_data)
+            try:
+                msg = ujson.loads(_ble_rx_buffer.decode("utf-8"))
+                if "tel" in msg and "act" in msg:
+                    telemetry_data["tel"] = msg.get("tel", {})
+                    telemetry_data["act"] = msg.get("act", {})
+                    telemetry_data["auto"] = msg.get("auto", {})
+                _ble_rx_buffer.clear()
+            except (ValueError, TypeError):
+                if len(_ble_rx_buffer) > 512:
+                    _ble_rx_buffer.clear()
+
+class _BLECentral:
+    def __init__(self):
+        self._ble = bluetooth.BLE()
+        self._ble.active(True)
+        self._ble.irq(_ble_irq)
+        self._addr_type = None
+        self._addr = None
+        self._name = None
+        self._conn_handle = None
+        self._start_handle = None
+        self._end_handle = None
+        self._tx_handle = None
+        self._rx_handle = None
+        self._scan_done_cb = None
+        self._conn_cb = None
+
+    def is_connected(self):
+        return (self._conn_handle is not None and
+                self._tx_handle is not None and
+                self._rx_handle is not None)
+
+    def scan_and_connect(self, timeout_ms=10000):
+        self._addr_type = None
+        self._addr = None
+        self._scan_done_cb = lambda: None
+        self._ble.gap_scan(int(timeout_ms), 30000, 30000)
+        deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
+        while self._addr is None and time.ticks_diff(deadline, time.ticks_ms()) > 0:
+            time.sleep_ms(100)
+        if self._addr is None:
+            print("[BLE] InnerPico not found")
+            return False
+        print("[BLE] Found", self._name, "connecting...")
+        self._conn_cb = None
+        self._ble.gap_connect(self._addr_type, self._addr)
+        deadline = time.ticks_add(time.ticks_ms(), 5000)
+        while not self.is_connected() and time.ticks_diff(deadline, time.ticks_ms()) > 0:
+            time.sleep_ms(50)
+        if self.is_connected():
+            print("[BLE] Connected to InnerPico")
+        return self.is_connected()
+
+    def write(self, data):
+        """Отправка команды на Inner (RX char)."""
+        if not self.is_connected():
+            return False
+        try:
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+            self._ble.gattc_write(self._conn_handle, self._rx_handle, data, 0)
+            return True
+        except Exception as e:
+            print("[BLE] Write error:", e)
+            return False
+
+ble_central = _BLECentral()
+
+
+# ── STT ───────────────────────────────────────────────────────────────────────
+
+def stream_transcribe(file_path, api_key):
+    host     = "mangisoz.nu.edu.kz"
+    path     = "/backend/api/v1/stt/transcribe"
+    boundary = "PicoWStreamBoundary"
+
+    file_size = os.stat(file_path)[6]
+
+    def field(name, value):
+        return "--{}\r\nContent-Disposition: form-data; name=\"{}\"\r\n\r\n{}\r\n".format(
+            boundary, name, value)
+
+    fields = [
+        field("language", "auto"),
+        field("response_format", "json"),
+        field("temperature", "1"),
+        field("include_raw", "false"),
+        field("stream", "false"),
+    ]
+
+    file_header = "--{}\r\nContent-Disposition: form-data; name=\"audio\"; filename=\"{}\"\r\nContent-Type: audio/wav\r\n\r\n".format(
+        boundary, file_path.split("/")[-1])
+    file_footer = "\r\n--{}--\r\n".format(boundary)
+
+    content_length = sum(len(f) for f in fields) + len(file_header) + file_size + len(file_footer)
+
+    addr  = socket.getaddrinfo(host, 443)[0][-1]
+    raw_s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw_s.connect(addr)
+    s = ssl.wrap_socket(raw_s, server_hostname=host)
+
+    headers = (
+        "POST {} HTTP/1.1\r\n"
+        "Host: {}\r\n"
+        "X-API-Key: {}\r\n"
+        "Content-Type: multipart/form-data; boundary={}\r\n"
+        "Content-Length: {}\r\n"
+        "Connection: close\r\n\r\n"
+    ).format(path, host, api_key, boundary, content_length)
+
+    s.write(headers.encode())
+    for f in fields:
+        s.write(f.encode())
+    s.write(file_header.encode())
+
+    with open(file_path, "rb") as f:
+        buf = bytearray(512)
+        while True:
+            n = f.readinto(buf)
+            if n == 0:
+                break
+            s.write(buf[:n])
+
+    s.write(file_footer.encode())
+
+    # Пропускаем HTTP-заголовки
+    while True:
+        line = s.readline()
+        if not line or line == b"\r\n":
+            break
+
+    body = bytearray()
+    while True:
+        chunk = s.read(256)
+        if not chunk:
+            break
+        body.extend(chunk)
+    s.close()
+    return ujson.loads(body.decode())["text"]
+
+
+# ── GPT ───────────────────────────────────────────────────────────────────────
+
+def ask_gpt(prompt_text, openai_key):
+    url = API_CONFIG['LLM_URL']
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + openai_key,
+    }
+    payload = {
+        "model": API_CONFIG['MODEL'],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": prompt_text},
+        ],
+    }
+    try:
+        res    = urequests.post(url, data=ujson.dumps(payload).encode("utf-8"), headers=headers)
+        result = res.json()
+        res.close()
+        if "choices" in result:
+            return result["choices"][0]["message"]["content"].strip().replace("`", "")
+        return "print('No choices')"
+    except Exception as e:
+        print("LLM error:", e)
+        return "print('LLM Error')"
+
+
+# ── Pipeline: запись → STT → GPT → отправка на Inner ─────────────────────────
+
+def process_recording(filepath):
+    global audio_in
+
+    print("Processing:", filepath)
+    connect_wifi()
+
+    gc.collect()
+    print("Transcribing...")
+    try:
+        text = stream_transcribe(filepath, API_CONFIG['STT_KEY'])
+        print("Text:", text)
+    except Exception as e:
+        print("STT error:", e)
+        return
+
+    print("Asking LLM...")
+    code = ask_gpt(text, API_CONFIG['LLM_KEY'])
+    print("Code:", code)
+
+    if ble_central.write(code):
+        print("Sent to Inner:", code)
+    else:
+        print("BLE not connected, cannot send")
+    reinit_microphone()
+
+
+# ── Globals shared with I2S callback ─────────────────────────────────────────
+state                           = STATE_MACHINE['PAUSE']
+num_sample_bytes_written_to_wav = 0
+num_read                        = 0
+mic_samples                     = bytearray(10000)
+mic_samples_mv                  = memoryview(mic_samples)
+wav                             = None
+last_filepath                   = None   # путь только что записанного файла
+recording_done                  = False  # флаг для main loop
+
+
+def i2s_callback_rx(arg):
+    global state, num_sample_bytes_written_to_wav, num_read, wav
+    global recording_done
+
+    if state == STATE_MACHINE['RECORD']:
+        wav.write(mic_samples_mv[:num_read])
+        num_sample_bytes_written_to_wav += num_read
+        num_read = audio_in.readinto(mic_samples_mv)
+
+    elif state == STATE_MACHINE['RESUME']:
+        state    = STATE_MACHINE['RECORD']
+        num_read = audio_in.readinto(mic_samples_mv)
+
+    elif state == STATE_MACHINE['PAUSE']:
+        num_read = audio_in.readinto(mic_samples_mv)
+
+    elif state == STATE_MACHINE['STOP']:
+        header = create_wav_header(
+            I2S_CONFIG['rate'],
+            I2S_CONFIG['bits'],
+            I2S_CONFIG['nch'],
+            num_sample_bytes_written_to_wav // (I2S_CONFIG['ibuf'] * I2S_CONFIG['nch']),
+        )
+        wav.seek(0)
+        wav.write(header)
+        wav.close()
+        print("WAV saved.")
+        recording_done = True   # сигнал main loop — можно отправлять
+
+
+# ── I2S init ──────────────────────────────────────────────────────────────────
+
+def init_i2s():
+    audio_in = I2S(
+        I2S_CONFIG['id'],
+        sck    = Pin(I2S_CONFIG['sck']),
+        ws     = Pin(I2S_CONFIG['ws']),
+        sd     = Pin(I2S_CONFIG['sd']),
+        mode   = I2S.RX,
+        bits   = I2S_CONFIG['bits'],
+        format = I2S.MONO,
+        rate   = I2S_CONFIG['rate'],
+        ibuf   = I2S_CONFIG['ibuf'],
+    )
+    audio_in.irq(i2s_callback_rx)
+    return audio_in
+
+
+def reinit_microphone():
+    """Deinit existing I2S and create a fresh one. Call after exec() to restore mic."""
+    global audio_in
+    try:
+        audio_in.deinit()
+    except Exception:
+        pass  # may already be deinited or corrupted by exec'd code
+    audio_in = init_i2s()
+    print("Mic reinit OK")
+
+
+audio_in = init_i2s()
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+button = Button(OUTER_MODULES['BUTTON'])
+buzzer = Buzzer(OUTER_MODULES['BUZZER'])
+led    = LED(OUTER_MODULES['LED'])
+
+debounce_ms    = 50
+last_btn_state = button.value()
+last_change_ms = time.ticks_ms()
+recording      = False
+
+connect_wifi()
+ble_central.scan_and_connect()
+
+print("Ready. Press button to start/stop recording.")
+
+while True:
+    # ── Если запись только что завершилась — отправляем ──────────────────
+    if recording_done:
+        recording_done = False
+        process_recording(last_filepath)
+
+    # ── Кнопка ───────────────────────────────────────────────────────────
+    now       = time.ticks_ms()
+    btn_state = button.value()
+
+    if btn_state != last_btn_state and time.ticks_diff(now, last_change_ms) > debounce_ms:
+        last_btn_state = btn_state
+        last_change_ms = now
+
+        if btn_state == 1:  # button pressed
+            if not recording:
+                last_filepath                   = next_wav_path()
+                wav                             = open(last_filepath, "wb")
+                wav.seek(44)
+                num_sample_bytes_written_to_wav = 0
+                recording                       = True
+                state                           = STATE_MACHINE['RECORD']
+                num_read                        = audio_in.readinto(mic_samples_mv)
+                print("● REC →", last_filepath)
+            else:
+                recording = False
+                state     = STATE_MACHINE['STOP']
+                print("■ Stopping...")
+
+    time.sleep_ms(10)

@@ -1,0 +1,4 @@
+.vscode/
+.micropico
+test.py
+secrets.py
