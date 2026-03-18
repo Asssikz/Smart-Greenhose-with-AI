@@ -61,6 +61,7 @@ def cooler_off():
     global automation_state, actuator_state
     actuator_state['COOLER'] = False
     automation_state['COOLER'] = False
+    automation_state['HEATER'] = False
     if not automation_state['HEATER']:
         fan_led.fill(fan_led.BLACK)
         fan_led.write()
@@ -70,6 +71,7 @@ def heater_on():
     global automation_state, actuator_state
     actuator_state['HEATER'] = True
     automation_state['HEATER'] = False
+    automation_state['COOLER'] = False
     fan_led.fill(fan_led.RED)
     fan_led.write()
     fan_ch.on()

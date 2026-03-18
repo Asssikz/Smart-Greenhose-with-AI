@@ -27,7 +27,7 @@ _IRQ_GATTS_WRITE        = const(3)
 _IRQ_MTU_EXCHANGED      = const(21)
 
 _FLAG_READ   = const(0x0002)
-_FLAG_WRITE  = const(0x0008)
+_FLAG_WRITE  = const(0x0004)
 _FLAG_NOTIFY = const(0x0010)
 
 # Стандартный сервис оставим, как у тебя

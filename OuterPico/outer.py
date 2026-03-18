@@ -227,7 +227,7 @@ def _ble_irq(event, data):
             # Подписываемся на Notify (CCCD = tx_handle + 1)
             cccd = ble_central._tx_handle + 1
             try:
-                ble.gattc_write(ble_central._conn_handle, cccd, b"\x01\x00", 1)
+                ble.gattc_write(ble_central._conn_handle, cccd, b"\x01\x00", 0)
             except Exception:
                 pass
             if ble_central._conn_cb:
