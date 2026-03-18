@@ -730,7 +730,3 @@ def main_loop():
                 print("■ Stopping...")
 
     time.sleep_ms(10)
-
-while True:
-    main_loop()
-
