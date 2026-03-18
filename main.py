@@ -1,4 +1,4 @@
-pibody = 'inner'
+pibody = 'outer'
 
 if pibody == 'outer':
     from OuterPico.outer import main_loop

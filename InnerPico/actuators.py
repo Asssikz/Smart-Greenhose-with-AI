@@ -199,6 +199,7 @@ def get_actuator_state(timer):
     }
     return actuator_state
 
+@periodic(2)
 def automation_loop(timer):
     global automation_state, actuator_state
     # Cooler
