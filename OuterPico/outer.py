@@ -49,6 +49,78 @@ print("SD mounted OK")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# Display Functions ────────────────────────────────────────────────────────────
+
+def telemetry_status():
+    tele = telemetry_data.get("tel")
+    display.text("Умная теплица", (240-len("Умная теплица")*8)//2-40, 3, fg=display.WHITE, font=display.font_medium)
+    
+    next_line = 10+13
+    display.text("Температура: " + str(tele["t"]) + " C  ", 10, next_line)
+    next_line += 13
+    display.linear_bar(10, next_line+8, 160, value=tele["t"], min_value=20, max_value=30, height=8, border=True, color=display.RED)
+    next_line += 4
+    next_line += 13
+    display.text("Влажность: " + str(tele["h"]) + " %  ", 10, next_line)
+    next_line += 13
+    display.linear_bar(10, next_line+8, 160, value=tele["h"], min_value=0, max_value=100, height=8, border=True, color=display.CYAN)
+    next_line += 4
+    next_line += 13
+    display.text("Освещенность: " + str(tele["l"]), 10, next_line)
+    next_line += 13
+    display.linear_bar(10, next_line+8, 160, value=tele["l"], min_value=0, max_value=1, height=8, border=True, color=display.YELLOW)
+    next_line += 4
+    next_line += 13
+    display.text("Влажность почвы: " + str(tele["s"]), 10, next_line)
+    next_line += 13
+    display.linear_bar(10, next_line+8, 160, value=tele["s"], min_value=0, max_value=1, height=8, border=True, color=display.GREEN)
+    # 126
+    next_line = 126+16
+    act = telemetry_data.get("act")
+    display.text("Куллер ", 10, next_line, fg=display.GREEN if act["c"] else display.RED)
+    display.text("|", 10 + len("Куллер ")*8, next_line, fg=display.WHITE)
+    display.text("Отопитель", 10 + len("Куллер ")*8 + len("/ ")*8, next_line, fg=display.GREEN if act["h"] else display.RED)
+    next_line += 14
+    display.text("Окна ", 10, next_line, fg=display.GREEN if (act["w1"] and act["w2"]) else display.RED)
+    display.text("|", 10 + len("Куллер ")*8, next_line, fg=display.WHITE)
+    display.text("Дверь ", 10 + len("Куллер ")*8 + len("/ ")*8, next_line, fg=display.GREEN if act["d"] else display.RED)
+    next_line += 14
+    display.text("Лампа ", 10, next_line, fg=display.GREEN if act["lg"] else display.RED)
+    display.text("|", 10 + len("Куллер ")*8, next_line, fg=display.WHITE)
+    display.text("Насос ", 10 + len("Куллер ")*8 + len("/ ")*8, next_line, fg=display.GREEN if act["p"] else display.RED)
+
+def stt_status(text):
+    display.fill_rect(0, 190, 240, 29, display.BLACK)
+    display.hline(0, 190, 240, display.WHITE)
+    display.text("Ваш запрос:", 10, 192, fg=display.WHITE)
+    text_wrap(text, 10, 192+14, max_lines=2)
+
+def gpt_status(text):
+    display.fill_rect(0, 244, 240, 29, display.BLACK)
+    display.hline(0, 244, 240, display.WHITE)
+    display.text("Ответ:", 10, 246, fg=display.WHITE)
+    text_wrap(text, 10, 246+14, max_lines=1)
+
+def debug_status(text):
+    display.fill_rect(0, 300, 240, 20, display.WHITE)
+    display.text(text, 10, 302, fg=display.BLACK, bg=display.WHITE)
+
+def WiFi_status(arg):
+    if arg == 0:
+        display.text("Wi-Fi", 240-len("Wi-Fi")*8, 1, fg=display.GREEN)
+    elif arg == 1:
+        display.text("Wi-Fi", 240-len("Wi-Fi")*8, 1, fg=display.WHITE)
+    elif arg == 2:
+        display.text("Wi-Fi", 240-len("Wi-Fi")*8, 1, fg=display.RED)
+
+def BLE_status(arg):
+    if arg == 0:
+        display.text("BLE", 240-len("BLE")*8, 15, fg=display.BLUE)
+    elif arg == 1:
+        display.text("BLE", 240-len("BLE")*8, 15, fg=display.WHITE)
+    elif arg == 2:
+        display.text("BLE", 240-len("BLE")*8, 15, fg=display.RED)
+
 def text_wrap(text, x, y, char_width=8, char_height=12, max_lines=None):
     """Draw text with automatic line wrapping. Width 240, font 8×12."""
     max_chars = (240 - x) // char_width
@@ -111,6 +183,7 @@ def create_wav_header(sample_rate, bits, channels, num_samples):
 def connect_wifi():
     import network
     wlan = network.WLAN(network.STA_IF)
+    WiFi_status(1)
     wlan.active(True)
     if not wlan.isconnected():
         print("Connecting to WiFi...")
@@ -121,8 +194,10 @@ def connect_wifi():
             time.sleep(1)
     if wlan.isconnected():
         print("WiFi OK:", wlan.ifconfig()[0])
+        WiFi_status(0)
     else:
         print("WiFi FAILED, status:", wlan.status())
+        WiFi_status(2)
 
 
 # ── BLE Central (подключение к Inner Pico) ────────────────────────────────────
@@ -199,6 +274,7 @@ def _ble_irq(event, data):
             ble_central._tx_handle   = None
             ble_central._rx_handle   = None
             print("[BLE] Disconnected")
+            debug_status("BLE disconnected")
 
     elif event == _IRQ_GATTC_SERVICE_RESULT:
         conn_handle, start_h, end_h, uuid = data
@@ -254,6 +330,7 @@ def _ble_irq(event, data):
                     telemetry_data["tel"]  = msg.get("tel", {})
                     telemetry_data["act"]  = msg.get("act", {})
                     telemetry_data["auto"] = msg.get("auto", {})
+                    telemetry_status()
                 _ble_rx_buffer[:] = b""
             except (ValueError, TypeError):
                 if len(_ble_rx_buffer) > 512:
@@ -282,6 +359,7 @@ class _BLECentral:
                 self._rx_handle  is not None)
 
     def scan_and_connect(self, timeout_ms=10000):
+        BLE_status(1)
         self._addr_type    = None
         self._addr         = None
         self._scan_done_cb = lambda: None
@@ -291,6 +369,7 @@ class _BLECentral:
             time.sleep_ms(100)
         if self._addr is None:
             print("[BLE] InnerPico not found")
+            debug_status("BLE not found")
             return False
         print("[BLE] Found", self._name, "connecting...")
         self._conn_cb = None
@@ -300,21 +379,34 @@ class _BLECentral:
             time.sleep_ms(50)
         if self.is_connected():
             print("[BLE] Connected to InnerPico")
+            BLE_status(0)
         return self.is_connected()
 
     def write(self, data):
-        """Отправка команды на Inner (RX char)."""
-        print("[BLE] Writing to InnerPico:", data)
+        """Отправка команды на Inner (RX char).
+        Если команд несколько (через ;), отправляет каждую отдельным пакетом.
+        """
         if not self.is_connected():
             return False
-        try:
-            if isinstance(data, str):
-                data = data.encode("utf-8")
-            self._ble.gattc_write(self._conn_handle, self._rx_handle, data, 0)
-            return True
-        except Exception as e:
-            print("[BLE] Write error:", e)
-            return False
+        if isinstance(data, str):
+            commands = [c.strip() for c in data.split(";") if c.strip()]
+        else:
+            commands = [data.decode("utf-8").strip()]
+
+        success = True
+        for cmd in commands:
+            raw = cmd.encode("utf-8")
+            if len(raw) > 20:
+                print("[BLE] Command too long ({} bytes), skipping: {}".format(len(raw), cmd))
+                success = False
+                continue
+            try:
+                self._ble.gattc_write(self._conn_handle, self._rx_handle, raw, 0)
+                time.sleep_ms(50)  # небольшая пауза между командами
+            except Exception as e:
+                print("[BLE] Write error:", e)
+                success = False
+        return success
 
 
 print("Initializing BLE central...")
@@ -426,10 +518,15 @@ def process_recording(filepath):
     global audio_in
 
     print("Processing:", filepath)
+    debug_status("Processing...")
 
     # ── Отключаем BLE перед WiFi: CYW43 не тянет оба одновременно ────────────
     print("[BLE] Suspending for WiFi...")
+    BLE_status(2)
     try:
+        ble_central._conn_handle  = None
+        ble_central._tx_handle    = None
+        ble_central._rx_handle    = None
         ble_central._ble.active(False)
     except Exception as e:
         print("[BLE] Deactivate error:", e)
@@ -441,7 +538,9 @@ def process_recording(filepath):
     text = None
     try:
         print("Transcribing...")
+        debug_status("Transcribing...")
         text = stream_transcribe(filepath, API_CONFIG['STT_KEY'])
+        stt_status(text)
         print("Text:", text)
     except Exception as e:
         print("STT error:", e)
@@ -450,7 +549,9 @@ def process_recording(filepath):
     if text:
         try:
             print("Asking LLM...")
+            debug_status("Asking AlemLLM...")
             code = ask_gpt(text, API_CONFIG['LLM_KEY'])
+            gpt_status(code)
             print("Code:", code)
         except Exception as e:
             print("LLM error:", e)
@@ -462,27 +563,35 @@ def process_recording(filepath):
         wlan = network.WLAN(network.STA_IF)
         wlan.disconnect()
         wlan.active(False)
+        WiFi_status(2)  
     except Exception as e:
         print("[WiFi] Disconnect error:", e)
     time.sleep_ms(300)
 
     print("[BLE] Restoring...")
+    debug_status("BLE restoring...")
+    BLE_status(1)
     try:
         ble_central._ble.active(True)
         ble_central._ble.irq(_ble_irq)
+        BLE_status(0)
     except Exception as e:
         print("[BLE] Reactivate error:", e)
     time.sleep_ms(300)
 
     if not ble_central.is_connected():
-        print("[BLE] Reconnecting to InnerPico...")
+        print("[BLE] Reconnecting to Greenhouse...")
+        debug_status("Reconnecting to Greenhouse...")
+        BLE_status(1)
         ble_central.scan_and_connect(timeout_ms=8000)
 
     if code:
         if ble_central.write(code):
             print("Sent to Inner:", code)
+            debug_status("Sent to Greenhouse")
         else:
             print("[BLE] Not connected, cannot send")
+            debug_status("BLE not connected, can't send")
 
     gc.collect()
     reinit_microphone()
@@ -578,10 +687,10 @@ last_btn_state = button.value()
 last_change_ms = time.ticks_ms()
 recording      = False
 
-print("Connecting to WiFi...")
 connect_wifi()
 ble_central.scan_and_connect()
 print("Ready. Press button to start/stop recording.")
+debug_status("Press button to start")
 
 
 # ── main_loop — вызывается из main.py ─────────────────────────────────────────
@@ -613,12 +722,15 @@ def main_loop():
                 state                           = STATE_MACHINE['RECORD']
                 num_read                        = audio_in.readinto(mic_samples_mv)
                 print("● REC →", last_filepath)
+                debug_status("Recording...")
             else:
                 recording = False
                 state     = STATE_MACHINE['STOP']
+                debug_status("Stopping...")
                 print("■ Stopping...")
 
     time.sleep_ms(10)
 
 while True:
     main_loop()
+

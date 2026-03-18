@@ -31,7 +31,7 @@ def telemetry_measurement(timer):
     global telemetry_data
     telemetry_data["temp"]          = round(climate.read_temperature(), 1) if climate is not None else 0
     telemetry_data["humidity"]      = round(climate.read_humidity(), 1) if climate is not None else 0
-    telemetry_data["light"]         = round(light_sensor.read(), 1)
-    telemetry_data["soil_moisture"] = round(soil_moisture.read(), 1)
+    telemetry_data["light"]         = round(light_sensor.read(), 2)
+    telemetry_data["soil_moisture"] = round(soil_moisture.read(), 2)
     telemetry_data["motion"]        = motion_sensor.read()
     return telemetry_data
