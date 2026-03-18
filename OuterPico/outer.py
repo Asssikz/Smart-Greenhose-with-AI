@@ -304,6 +304,7 @@ class _BLECentral:
 
     def write(self, data):
         """Отправка команды на Inner (RX char)."""
+        print("[BLE] Writing to InnerPico:", data)
         if not self.is_connected():
             return False
         try:
@@ -425,25 +426,65 @@ def process_recording(filepath):
     global audio_in
 
     print("Processing:", filepath)
-    connect_wifi()
 
-    gc.collect()
-    print("Transcribing...")
+    # ── Отключаем BLE перед WiFi: CYW43 не тянет оба одновременно ────────────
+    print("[BLE] Suspending for WiFi...")
     try:
+        ble_central._ble.active(False)
+    except Exception as e:
+        print("[BLE] Deactivate error:", e)
+    time.sleep_ms(300)
+
+    connect_wifi()
+    gc.collect()
+
+    text = None
+    try:
+        print("Transcribing...")
         text = stream_transcribe(filepath, API_CONFIG['STT_KEY'])
         print("Text:", text)
     except Exception as e:
         print("STT error:", e)
-        return
 
-    print("Asking LLM...")
-    code = ask_gpt(text, API_CONFIG['LLM_KEY'])
-    print("Code:", code)
+    code = None
+    if text:
+        try:
+            print("Asking LLM...")
+            code = ask_gpt(text, API_CONFIG['LLM_KEY'])
+            print("Code:", code)
+        except Exception as e:
+            print("LLM error:", e)
 
-    if ble_central.write(code):
-        print("Sent to Inner:", code)
-    else:
-        print("BLE not connected, cannot send")
+    # ── Отключаем WiFi, восстанавливаем BLE ──────────────────────────────────
+    print("[WiFi] Disconnecting...")
+    try:
+        import network
+        wlan = network.WLAN(network.STA_IF)
+        wlan.disconnect()
+        wlan.active(False)
+    except Exception as e:
+        print("[WiFi] Disconnect error:", e)
+    time.sleep_ms(300)
+
+    print("[BLE] Restoring...")
+    try:
+        ble_central._ble.active(True)
+        ble_central._ble.irq(_ble_irq)
+    except Exception as e:
+        print("[BLE] Reactivate error:", e)
+    time.sleep_ms(300)
+
+    if not ble_central.is_connected():
+        print("[BLE] Reconnecting to InnerPico...")
+        ble_central.scan_and_connect(timeout_ms=8000)
+
+    if code:
+        if ble_central.write(code):
+            print("Sent to Inner:", code)
+        else:
+            print("[BLE] Not connected, cannot send")
+
+    gc.collect()
     reinit_microphone()
 
 
@@ -451,7 +492,10 @@ def process_recording(filepath):
 state                           = STATE_MACHINE['PAUSE']
 num_sample_bytes_written_to_wav = 0
 num_read                        = 0
-mic_samples                     = bytearray(10000)
+# mic_samples — половина ibuf: IRQ срабатывает когда половина буфера заполнена,
+# за это время пишем предыдущую половину. Так снижается нагрузка на CPU.
+_MIC_BUF_SIZE = I2S_CONFIG['ibuf'] // 2
+mic_samples   = bytearray(_MIC_BUF_SIZE)
 mic_samples_mv                  = memoryview(mic_samples)
 wav                             = None
 last_filepath                   = None
@@ -475,22 +519,27 @@ def i2s_callback_rx(arg):
         num_read = audio_in.readinto(mic_samples_mv)
 
     elif state == STATE_MACHINE['STOP']:
+        # Переключаем сразу, чтобы не войти сюда повторно
+        state = STATE_MACHINE['PAUSE']
         header = create_wav_header(
             I2S_CONFIG['rate'],
             I2S_CONFIG['bits'],
             I2S_CONFIG['nch'],
-            num_sample_bytes_written_to_wav // (I2S_CONFIG['ibuf'] * I2S_CONFIG['nch']),
+            num_sample_bytes_written_to_wav // (I2S_CONFIG['bits'] // 8 * I2S_CONFIG['nch']),
         )
         wav.seek(0)
         wav.write(header)
         wav.close()
         print("WAV saved.")
         recording_done = True
+        # Продолжаем читать, чтобы IRQ-цепочка не оборвалась
+        num_read = audio_in.readinto(mic_samples_mv)
 
 
 # ── I2S init ──────────────────────────────────────────────────────────────────
 
 def init_i2s():
+    # ibuf должен быть 4096 в config.py (не WAV_SAMPLE_SIZE_IN_BYTES!)
     _audio = I2S(
         I2S_CONFIG['id'],
         sck    = Pin(I2S_CONFIG['sck']),
@@ -570,3 +619,6 @@ def main_loop():
                 print("■ Stopping...")
 
     time.sleep_ms(10)
+
+while True:
+    main_loop()

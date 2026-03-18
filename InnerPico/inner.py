@@ -254,7 +254,7 @@ def _notify_telemetry():
 # ─────────────────────────────────────────────────────────────
 # Main loop
 # ─────────────────────────────────────────────────────────────
-_NOTIFY_INTERVAL_MS = const(500)
+_NOTIFY_INTERVAL_MS = const(1000)
 
 def main_loop():
     _notify_telemetry()

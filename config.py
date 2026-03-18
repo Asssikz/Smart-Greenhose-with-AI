@@ -35,7 +35,7 @@ I2S_CONFIG = {
     'buffer_length': BUFFER_LENGTH_IN_BYTES,
     'bits': WAV_SAMPLE_SIZE_IN_BITS, 
     'rate': SAMPLE_RATE_IN_HZ, 
-    'ibuf': WAV_SAMPLE_SIZE_IN_BYTES,
+    'ibuf': 4096,
     'nch': NUM_CHANNELS}
 # ── I2S and Audio CONFIGURATION ───────────────────────────────────────────────
 # ── State machine ─────────────────────────────────────────────────────────────
