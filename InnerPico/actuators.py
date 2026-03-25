@@ -89,19 +89,19 @@ def window_1_open():
     global automation_state, actuator_state
     actuator_state['WINDOW_1'] = True
     automation_state['WINDOWS'] = False
-    window_1.angle(90)
+    window_1.angle(80)
 
 def window_1_close():
     global automation_state, actuator_state
     actuator_state['WINDOW_1'] = False
     automation_state['WINDOWS'] = False
-    window_1.angle(0)
+    window_1.angle(10)
 
 def window_2_open():
     global automation_state, actuator_state
     actuator_state['WINDOW_2'] = True
     automation_state['WINDOWS'] = False
-    window_2.angle(90)
+    window_2.angle(75)
 
 def window_2_close():
     global automation_state, actuator_state
@@ -127,7 +127,7 @@ def door_close():
     global automation_state, actuator_state
     actuator_state['DOOR'] = False
     automation_state['DOOR'] = False
-    door.angle(50)
+    door.angle(70)
 
 def light_on():
     global automation_state, actuator_state
@@ -193,9 +193,9 @@ def get_actuator_state(timer):
     actuator_state = {
         'COOLER': True if fan_led[0] == fan_led.CYAN else False,
         'HEATER': True if fan_led[0] == fan_led.RED else False,
-        'WINDOW_1': True if window_1.angle() == 0 else False,
+        'WINDOW_1': True if window_1.angle() == 10 else False,
         'WINDOW_2': True if window_2.angle() == 0 else False,
-        'DOOR': True if door.angle() == 90 else False,
+        'DOOR': True if door.angle() == 0 else False,
         'LIGHT': True if light[0] != light.BLACK else False,
         'PUMP': True if pump.value() == 1 else False
     }

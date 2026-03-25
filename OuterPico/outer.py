@@ -90,7 +90,7 @@ def telemetry_status():
     display.text("Насос ", 10 + len("Куллер ")*8 + len("/ ")*8, next_line, fg=display.GREEN if act["p"] else display.RED)
 
 def stt_status(text):
-    display.fill_rect(0, 190, 240, 29, display.BLACK)
+    display.fill_rect(0, 190, 240, 50, display.BLACK)
     display.hline(0, 190, 240, display.WHITE)
     display.text("Ваш запрос:", 10, 192, fg=display.WHITE)
     text_wrap(text, 10, 192+14, max_lines=2)
